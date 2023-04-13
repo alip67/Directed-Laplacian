@@ -1,6 +1,7 @@
 import numpy as np
 from numpy import linalg as LA
 from scipy.sparse import coo_matrix
+from nl.utilsnl import Laplacian_Nonlinear_torch,Laplacian_Nonlinear
 
 def cheb_poly_sparse(A, K):
     K += 1
@@ -21,7 +22,7 @@ def cheb_poly_sparse(A, K):
 
     return multi_order_laplacian
 
-def hermitian_decomp_sparse(row, col, size, q = 0.25, norm = True, laplacian = True, max_eigen = 2, 
+def hermitian_decomp_sparse(X, m,E,row, col, size, q = 0.25, norm = True, laplacian = True, max_eigen = 2, 
 gcn_appr = False, edge_weight = None):
     if edge_weight is None:
         A = coo_matrix((np.ones(len(row)), (row, col)), shape=(size, size), dtype=np.float32)
@@ -31,6 +32,8 @@ gcn_appr = False, edge_weight = None):
     diag = coo_matrix( (np.ones(size), (np.arange(size), np.arange(size))), shape=(size, size), dtype=np.float32)
     if gcn_appr:
         A += diag
+
+    A = Laplacian_Nonlinear(size, E, X, m)
 
     A_sym = 0.5*(A + A.T) # symmetrized adjacency
 

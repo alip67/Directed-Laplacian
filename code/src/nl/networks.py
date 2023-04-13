@@ -61,7 +61,11 @@ class HyperGCN(nn.Module):
             # gcn_pred, enc_loss=hidden.forward_autoencoder(self.structure, H, m)
             # H = F.relu(gcn_pred)
             # total_loss_enc += enc_loss
-            H = F.relu(hidden.forward(self.structure, H, m))
+
+            # gcn_pred, enc_loss=hidden.forward_labelencoder(self.structure, H, m)
+            # H = F.relu(gcn_pred)
+            # total_loss_enc += enc_loss
+            H = F.relu(hidden.forward_coordinate(self.structure, H, m))
             if i < l - 1:
                 V = H
                 H = F.dropout(H, do, training=self.training)

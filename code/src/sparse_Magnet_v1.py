@@ -11,16 +11,13 @@ from torch_sparse import SparseTensor
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch_geometric.datasets import WebKB, WikipediaNetwork, WikiCS
-from tqdm import tqdm
 
 # internal files
 from utils.Citation import *
-from layer.sparse_magnet import *
+from layer.sparse_lapnet import *
 from utils.preprocess import geometric_dataset_sparse, load_syn
 from utils.save_settings import write_log
-from torch.autograd import Variable
-
-from layer import model
+from utils.hermitian import hermitian_decomp_sparse
 
 # select cuda device if available
 cuda_device = 0
@@ -31,11 +28,12 @@ def parse_args():
     parser.add_argument('--log_root', type=str, default='../logs/', help='the path saving model.t7 and the training process')
     parser.add_argument('--log_path', type=str, default='test', help='the path saving model.t7 and the training process, the name of folder will be log/(current time)')
     parser.add_argument('--data_path', type=str, default='code/dataset/data/tmp/', help='data set folder, for default format see dataset/cora/cora.edges and cora.node_labels')
-    parser.add_argument('--dataset', type=str, default='WebKB/Cornell', help='data set selection')
+    parser.add_argument('--dataset', type=str, default='cora_ml/', help='data set selection telegram/telegram WebKB/Cornell WebKB/Wisconsin WebKB/Texas cora_ml/ citeseer/')
 
-    parser.add_argument('--epochs', type=int, default=1000, help='Number of (maximal) training epochs.')
-    # parser.add_argument('--depth', type=int, default=3000, help='Number of (maximal) training epochs.')
+    parser.add_argument('--epochs', type=int, default=2000, help='Number of (maximal) training epochs.')
     parser.add_argument('--q', type=float, default=0, help='q value for the phase matrix')
+    parser.add_argument('--mediators', action='store_true', help='True for Laplacian with mediators, False for Laplacian without mediators')
+    parser.add_argument('--fast', '-F', action='store_true', help='faster version of HyperGCN (True)')
     parser.add_argument('--method_name', type=str, default='Magnet', help='method name')
 
     parser.add_argument('--K', type=int, default=1, help='K for cheb series')
@@ -43,14 +41,11 @@ def parse_args():
     parser.add_argument('--dropout', type=float, default=0.5, help='dropout prob')
 
     parser.add_argument('--debug', '-D', action='store_true', help='debug mode')
-    parser.add_argument('--fast', '-F', action='store_true', help='faster version of HyperGCN (True)')
-    parser.add_argument('--mediators', action='store_true', help='True for Laplacian with mediators, False for Laplacian without mediators')
-    parser.add_argument('--lr', type=float, default=1e-2, help='learning rate')
-    parser.add_argument('--decay', type=float, default=0.0005, help='weight decay')
+    parser.add_argument('--lr', type=float, default=5e-3, help='learning rate')
     parser.add_argument('--l2', type=float, default=5e-4, help='l2 regularizer')
 
-    parser.add_argument('--num_filter', type=int, default=32, help='num of filters')
-    parser.add_argument('--randomseed', type=int, default=3407, help='if set random seed in training')  
+    parser.add_argument('--num_filter', type=int, default=64, help='num of filters')
+    parser.add_argument('--randomseed', type=int, default=3407, help='if set random seed in training')
     return parser.parse_args()
 
 def sparse_mx_to_torch_sparse_tensor(sparse_mx):
@@ -61,6 +56,20 @@ def sparse_mx_to_torch_sparse_tensor(sparse_mx):
     values = torch.from_numpy(sparse_mx.data)
     shape = torch.Size(sparse_mx.shape)
     return torch.sparse.FloatTensor(indices, values, shape)
+
+def print_statistics(results):
+    
+    val_total_acc = results[:, 0]
+    val_total_acc_str = f'{val_total_acc.mean():.4f} ± {val_total_acc.std():.4f}'
+    test_total_acc = results[:, 1]
+    test_total_acc_str = f'{test_total_acc.mean():.4f} ± {test_total_acc.std():.4f}'
+    val_total_acc_latest = results[:, 2]
+    val_total_acc_latest_str = f'{val_total_acc_latest.mean():.4f} ± {val_total_acc_latest.std():.4f}'
+    test_total_acc_latest = results[:, 3]
+    test_total_acc_latest_str = f'{test_total_acc_latest.mean():.4f} ± {test_total_acc_latest.std():.4f}'
+    print(f'All runs:')
+    logstr = 'val_acc: '+val_total_acc_str+' test_acc: '+test_total_acc_str+' val_acc_latest: '+val_total_acc_latest_str+' test_acc_latest: '+test_total_acc_latest_str
+    print(logstr)
 
 def main(args):
     if args.randomseed > 0:
@@ -88,23 +97,19 @@ def main(args):
         print("wrong dataset name !!!")
         return
 
-    dataset, X, label, train_mask, val_mask, test_mask, L = geometric_dataset_sparse(args.q, args.K, args.mediators,
+    dataset, X, E, label, train_mask, val_mask, test_mask = geometric_dataset_sparse(args.q, args.K, args.mediators, 
                             root=args.data_path+load_func, subset=subset,
-                            dataset = func, load_only = False, save_pk = True)
-    
-    # if load_func == 'cora_ml':
-    #     dataset = dataset[0]
-    # elif load_func == 'citeseer_npz':
-    #     dataset = dataset[0]
-    # else:
-    #     print("wrong dataset name !!!")
-    #     return
+                            dataset = func, load_only = True, save_pk = True)
   
     # normalize label, the minimum should be 0 as class index
     _label_ = label - np.amin(label)
     cluster_dim = np.amax(_label_)+1
 
+ 
+
     label = torch.from_numpy(_label_[np.newaxis]).to(device)
+    X_img  = torch.FloatTensor(X).to(device)
+    X_real = torch.FloatTensor(X).to(device)
     criterion = nn.NLLLoss()
 
     splits = train_mask.shape[1]
@@ -113,45 +118,25 @@ def main(args):
         test_mask = np.repeat(test_mask[:,np.newaxis], splits, 1)
 
     results = np.zeros((splits, 4))
-    for split in tqdm(range(splits)):
+    for split in range(splits):
         log_str_full = ''
+
+        model = LapNet(X_real.size(-1), dataset, args.q, K = args.K, label_dim=cluster_dim, layer = args.layer,
+                        num_filter = args.num_filter, dropout=args.dropout, fast= args.fast).to(device)    
+ 
+        opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.l2)
 
         best_test_acc = 0.0
         train_index = train_mask[:,split]
         val_index = val_mask[:,split]
         test_index = test_mask[:,split]
 
-        # X = X[:, :10]
-
-
-        # # initialise HyperGCN
-        HyperGCN, X_norm = model.initialise(dataset,X, label,train_index,cluster_dim, args)
-        # X_norm = torch.FloatTensor(X).to(device)
-        X_norm = X_norm.to(device)
-
-        
-
-
-
-        # # train and test HyperGCN
-        # HyperGCN = model.train(HyperGCN, dataset, train, args)
-        # acc = model.test(HyperGCN, dataset, test, args)
-        # print("accuracy:", float(acc), ", error:", float(100*(1-acc)))
-
-        # model = MagNet(X_real.size(-1), L_real, L_img, K = args.K, label_dim=cluster_dim, layer = args.layer,
-        #                 num_filter = args.num_filter, dropout=args.dropout).to(device)    
-
-        modelnl = HyperGCN['model']
-        opt = HyperGCN['optimiser']
-
-
-
         #################################
         # Train/Validation/Test
         #################################
         best_test_err = 1000.0
         early_stopping = 0
-        for epoch in tqdm(range(args.epochs)):
+        for epoch in range(args.epochs):
             start_time = time.time()
             ####################
             # Train
@@ -161,13 +146,11 @@ def main(args):
             # for loop for batch loading
             count += np.sum(train_index)
 
-            modelnl.train()
-            # preds, loss_encoder = modelnl(X_norm)
-            preds, loss_encoder = modelnl(X_norm, train_index, label[:,train_index].squeeze())
-            # train_loss = F.nll_loss(preds[train_index,:], label[:,train_index].squeeze())+ loss_encoder
-            train_loss = F.nll_loss(preds[train_index,:], label[:,train_index].squeeze())
+            model.train()
+            preds = model(X_real, X_img)
+            train_loss = criterion(preds[:,:,train_index], label[:,train_index])
             pred_label = preds.max(dim = 1)[1]
-            train_acc = 1.0*((pred_label.unsqueeze(0)[:,train_index] == label[:,train_index])).sum().detach().item()/count
+            train_acc = 1.0*((pred_label[:,train_index] == label[:,train_index])).sum().detach().item()/count
             opt.zero_grad()
             train_loss.backward()
             opt.step()
@@ -177,17 +160,16 @@ def main(args):
             ####################
             # Validation
             ####################
-            modelnl.eval()
+            model.eval()
             count, test_loss, test_acc = 0.0, 0.0, 0.0
             
             # for loop for batch loading
             count += np.sum(val_index)
-            preds,loss_encoder = modelnl(X_norm, train_index, label[:,train_index].squeeze())
+            preds = model(X_real, X_img)
             pred_label = preds.max(dim = 1)[1]
 
-            # test_loss = F.nll_loss(preds[val_index,:], label[:,val_index].squeeze()) + loss_encoder
-            test_loss = F.nll_loss(preds[val_index,:], label[:,val_index].squeeze()) 
-            test_acc = 1.0*((pred_label.unsqueeze(0)[:,val_index] == label[:,val_index])).sum().detach().item()/count
+            test_loss = criterion(preds[:,:,val_index], label[:,val_index])
+            test_acc = 1.0*((pred_label[:,val_index] == label[:,val_index])).sum().detach().item()/count
 
             outstrval = ' Test loss:, %.6f, acc:, %.3f,' % (test_loss.detach().item(), test_acc)
             
@@ -203,11 +185,11 @@ def main(args):
             if save_perform <= best_test_err:
                 early_stopping = 0
                 best_test_err = save_perform
-                torch.save(modelnl.state_dict(), log_path + '/model'+str(split)+'.t7')
+                torch.save(model.state_dict(), log_path + '/model'+str(split)+'.t7')
             else:
                 early_stopping += 1
             if early_stopping > 500 or epoch == (args.epochs-1):
-                torch.save(modelnl.state_dict(), log_path + '/model_latest'+str(split)+'.t7')
+                torch.save(model.state_dict(), log_path + '/model_latest'+str(split)+'.t7')
                 break
 
         write_log(vars(args), log_path)
@@ -215,29 +197,29 @@ def main(args):
         ####################
         # Testing
         ####################
-        modelnl.load_state_dict(torch.load(log_path + '/model'+str(split)+'.t7'))
-        modelnl.eval()
-        preds, loss_encoder = modelnl(X_norm, train_index, label[:,train_index].squeeze())
+        model.load_state_dict(torch.load(log_path + '/model'+str(split)+'.t7'))
+        model.eval()
+        preds = model(X_real, X_img)
         pred_label = preds.max(dim = 1)[1]
         np.save(log_path + '/pred' + str(split), pred_label.to('cpu'))
     
         count = np.sum(val_index)
-        acc_train = (1.0*((pred_label.unsqueeze(0)[:,val_index] == label[:,val_index])).sum().detach().item())/count
+        acc_train = (1.0*((pred_label[:,val_index] == label[:,val_index])).sum().detach().item())/count
 
         count = np.sum(test_index)
-        acc_test = (1.0*((pred_label.unsqueeze(0)[:,test_index] == label[:,test_index])).sum().detach().item())/count
+        acc_test = (1.0*((pred_label[:,test_index] == label[:,test_index])).sum().detach().item())/count
 
-        modelnl.load_state_dict(torch.load(log_path + '/model_latest'+str(split)+'.t7'))
-        modelnl.eval()
-        preds, loss_encoder = modelnl(X_norm, train_index, label[:,train_index].squeeze())
+        model.load_state_dict(torch.load(log_path + '/model_latest'+str(split)+'.t7'))
+        model.eval()
+        preds = model(X_real, X_img)
         pred_label = preds.max(dim = 1)[1]
         np.save(log_path + '/pred_latest' + str(split), pred_label.to('cpu'))
     
         count = np.sum(val_index)
-        acc_train_latest = (1.0*((pred_label.unsqueeze(0)[:,val_index] == label[:,val_index])).sum().detach().item())/count
+        acc_train_latest = (1.0*((pred_label[:,val_index] == label[:,val_index])).sum().detach().item())/count
 
         count = np.sum(test_index)
-        acc_test_latest = (1.0*((pred_label.unsqueeze(0)[:,test_index] == label[:,test_index])).sum().detach().item())/count
+        acc_test_latest = (1.0*((pred_label[:,test_index] == label[:,test_index])).sum().detach().item())/count
 
         ####################
         # Save testing results
@@ -250,6 +232,7 @@ def main(args):
             file.write(log_str_full)
             file.write('\n')
         torch.cuda.empty_cache()
+    print_statistics(results)
     return results
 
 if __name__ == "__main__":

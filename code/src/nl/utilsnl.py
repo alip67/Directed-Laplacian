@@ -9,6 +9,9 @@ from torch.nn.modules.module import Module
 from torch.nn.parameter import Parameter
 import networkx as nx
 import random
+from tqdm import tqdm
+from multiprocessing import Pool
+from typing import List
 
 def get_net(d_in, lst_hidden_dim):
     layers = []
@@ -28,7 +31,6 @@ def get_net_decoder(d_in, lst_hidden_dim):
         layers.append(nn.ReLU())
     layers.append(nn.Linear(lst_hidden_dim[-1], d_in))
     return layers
-
 
 class autoencoder(nn.Module):
     def __init__(self,d_in,d_hidden, num_feat):
@@ -85,10 +87,9 @@ class autoencoder(nn.Module):
 
         return X, X_enc_out
     
-
 class labelencoder(nn.Module):
     def __init__(self,d_in,d_hidden, num_feat):
-        super(autoencoder, self).__init__()
+        super(labelencoder, self).__init__()
         self.d_in = d_in
         self.d_hidden = d_hidden
 
@@ -168,9 +169,10 @@ class HyperGraphConvolution(Module):
         self.a, self.b = a, b
         self.reapproximate, self.cuda = reapproximate, cuda
         # self.autoencoder = autoencoder(self.b, self.b//2,self.a)
+        self.labelencoder = labelencoder(self.b, self.b//2,self.a)
 
         self.emb = nn.Linear(b, 1, bias=True)
-        # self.activation = nn.ReLU()
+        self.activation = nn.Tanh()
 
         self.W = Parameter(torch.FloatTensor(a, b))
         self.bias = Parameter(torch.FloatTensor(b))
@@ -194,6 +196,7 @@ class HyperGraphConvolution(Module):
         HW = torch.mm(H, W)
         # HW = self.lin(H)
         embed = self.emb(HW)
+        # embed = self.activation(embed)
         # embedding = self.embedding(HW)
         
 
@@ -203,8 +206,11 @@ class HyperGraphConvolution(Module):
             A = Laplacian_Nonlinear_torch(n, structure, embed, m)
         else: A = structure
 
+        print("grad for blockbox : " , self.emb.weight)
+
         if self.cuda: A = A.cuda()
         A = Variable(A)
+        # print(A)
 
         AHW = SparseMM.apply(A, HW)     
         return AHW + b
@@ -233,22 +239,61 @@ class HyperGraphConvolution(Module):
         AHW = SparseMM.apply(A, HW)     
         return AHW + b, loss_enc
     
+    def forward_labelencoder(self, structure, H, m=True):
+
+
+        W, b = self.W, self.bias
+        # HW = torch.mm(H, W)
+        pred_out, hidden_1dim_out = self.labelencoder(H)
+        loss_enc = F.nll_loss(reconstruct_out, H)
+        # HW = self.lin(H)
+        # embed = self.emb(HW)
+        # embedding = self.embedding(HW)
+        
+        HW = torch.mm(H, W)
+        if self.reapproximate:
+            n, X = H.shape[0], HW.cpu().detach().numpy()
+            # A = Laplacian_Nonlinear(n, structure, X, m)
+            A = Laplacian_Nonlinear(n, structure, hidden_1dim_out, m)
+        else: A = structure
+
+        if self.cuda: A = A.cuda()
+        A = Variable(A)
+
+        AHW = SparseMM.apply(A, HW)     
+        return AHW + b, loss_enc
+    
 
     def forward_coordinate(self, structure, H, m=True):
         W, b = self.W, self.bias
 
         n, nclos = H.shape[0], H.shape[1]
 
-        concat = torch.zeros(n,nclos).cuda()
+        if self.cuda: structure = structure.cuda()
 
+        
+        # for i in range(len(self.mul_L_real)): # [K, B, N, D]
+        #     future.append(torch.jit.fork(process, 
+        #                     self.mul_L_real[i], self.mul_L_imag[i], 
+        #                     self.weight[i], X_real, X_imag))
+        # result = []
+        # for i in range(len(self.mul_L_real)):
+        #     result.append(torch.jit.wait(future[i]))
+        # result = torch.sum(torch.stack(result), dim=0)
+        
+        future = []
         if self.reapproximate:
-            for i in range(nclos): 
+            for i in tqdm(range(nclos)): 
                 vec = H[:,i]
-                Adj = Laplacian_Nonlinear_coordinate(n, structure, vec, m)
-                if self.cuda: Adj = Adj.cuda()
-                AdjVec = torch.mm(Adj, torch.unsqueeze(vec,1))
-                concat[:,i] = AdjVec.squeeze()
-        else: A = structure
+                future.append(torch.jit.fork(Laplacian_Nonlinear_coordinate, 
+                            n, structure, vec, m))
+
+            result = []
+            for i in range(nclos):
+                result.append(torch.jit.wait(future[i]))
+
+            concat = torch.stack(result, dim =1).squeeze()
+        else: concat = structure
 
         # HW = torch.mm(H, W)
 
@@ -270,8 +315,7 @@ class SparseMM(torch.autograd.Function):
     """
     Sparse x dense matrix multiplication with autograd support.
     Implementation by Soumith Chintala:
-    https://discuss.pytorch.org/t/
-    does-pytorch-support-autograd-on-sparse-matrix/6156/7
+    https://discuss.pytorch.org/t/does-pytorch-support-autograd-on-sparse-matrix/6156/7
     """
     @staticmethod
     def forward(ctx, M1, M2):
@@ -290,7 +334,6 @@ class SparseMM(torch.autograd.Function):
             g2 = torch.mm(M1.t(), g)
 
         return g1, g2
-
 
 def nonlinear_laplacian_sparse(row, col, size, q = 0.25, norm = True, laplacian = True, max_eigen = 2, 
 gcn_appr = False, edge_weight = None):
@@ -344,8 +387,14 @@ def Laplacian_Nonlinear(V, E, X, m):
     
     edges, weights = [], {}
     # p = X
-    rv = np.random.rand(X.shape[1])
+    # rv = np.random.rand(X.shape[1])
+    rv = np.load("rv_0.npy",allow_pickle=True)
+    print(rv)
+    print(rv.shape)
+    # print("this is random projection: " , rv)
+    # np.save("rv_2.npy",rv)
     p = np.dot(X, rv)   #projection onto a random vector rv
+    # print(p)
     # p = X
 
     row, col = E[0], E[1]
@@ -355,8 +404,8 @@ def Laplacian_Nonlinear(V, E, X, m):
     Adj = coo_matrix((np.ones(len(row)), (row, col)), shape=(size, size), dtype=np.float32)
 
     # A_sym = 0.5*(A + A.T) # symmetrized adjacency
-    G_undirected = nx.from_scipy_sparse_matrix(Adj)
-    G = nx.from_scipy_sparse_matrix(Adj,create_using=nx.DiGraph)
+    G_undirected = nx.from_scipy_sparse_array(Adj)
+    G = nx.from_scipy_sparse_array(Adj,create_using=nx.DiGraph)
     assert G.is_directed()
     directed_edges = [e for e in G.edges]
     diag = coo_matrix( (np.ones(size), (np.arange(size), np.arange(size))), shape=(size, size), dtype=np.float32)
@@ -400,7 +449,10 @@ def Laplacian_Nonlinear_torch(V, E, X, m):
     """
     
     edges, weights = [], {}
-    p = X.squeeze()
+    rv = np.random.rand(X.shape[1])
+    p = np.dot(X, rv)   #projection onto a random vector rv
+
+    # p = X.squeeze()
     # rv = torch.rand(X.shape[1]).cuda()
     # p = torch.matmul(X, rv)   #projection onto a random vector rv
     # p = X
@@ -446,7 +498,31 @@ def Laplacian_Nonlinear_torch(V, E, X, m):
     
     return adjacency(edges, weights, V, m)
 
+def multiprocess(max_values, lst_directed_edges, edges, weights): 
+        for i, val in enumerate(max_values):
+            u,v = lst_directed_edges[i]
+            if val == 0: 
+                edges.extend([[u, u], [v, v]])
+                if (u,u) not in weights:
+                    weights[(u,u)] = 0
+                weights[(u,u)] += float(1)
 
+                if (v,v) not in weights:
+                    weights[(v,v)] = 0
+                weights[(v,v)] += float(1)
+            else: 
+                edges.extend([[u, v], [v, u]])
+                if (u,v) not in weights:
+                    weights[(u,v)] = 0
+                weights[(u,v)] += float(1)
+
+                if (v,u) not in weights:
+                    weights[(v,u)] = 0
+                weights[(v,u)] += float(1)
+
+        return (edges, weights) 
+
+# @torch.no_grad()
 def Laplacian_Nonlinear_coordinate(V, E, X, m):
     """
     approximates the E defined by the E Laplacian with/without mediators
@@ -469,20 +545,58 @@ def Laplacian_Nonlinear_coordinate(V, E, X, m):
 
     row, col = E[0], E[1]
     size = V
+    # edges = edges.cuda()
+    # weights = weights.cuda()
 
+    lst_directed_edges = [(E[0][i].item(),E[1][i].item()) for i in range(E.shape[1])]
+    lst_direction_values = torch.stack([p[E[0][i]] - p[E[1][i]] for i in range(E.shape[1])])
+    torch_zeros = torch.zeros(E.shape[1]).cuda()
 
-    Adj = coo_matrix((np.ones(len(row)), (row, col)), shape=(size, size), dtype=np.float32)
+    max_values = torch.maximum(lst_direction_values,torch_zeros)
 
-    # A_sym = 0.5*(A + A.T) # symmetrized adjacency
-    G_undirected = nx.from_scipy_sparse_matrix(Adj)
-    G = nx.from_scipy_sparse_matrix(Adj,create_using=nx.DiGraph)
-    assert G.is_directed()
-    directed_edges = [e for e in G.edges]
-    diag = coo_matrix( (np.ones(size), (np.arange(size), np.arange(size))), shape=(size, size), dtype=np.float32)
+    for i, val in enumerate(max_values):
+        u,v = lst_directed_edges[i]
+        if val == 0: 
+            edges.extend([[u, u], [v, v]])
+            if (u,u) not in weights:
+                weights[(u,u)] = 0
+            weights[(u,u)] += float(1) + val 
 
-    for k in directed_edges:
-        u,v = k[0], k[1]
-        if p[u] >= p[v]:
+            if (v,v) not in weights:
+                weights[(v,v)] = 0
+            weights[(v,v)] += float(1)
+        else: 
+            edges.extend([[u, v], [v, u]])
+            if (u,v) not in weights:
+                weights[(u,v)] = 0
+            weights[(u,v)] += float(1) + val 
+
+            if (v,u) not in weights:
+                weights[(v,u)] = 0
+            weights[(v,u)] += float(1) 
+
+    # multi_proceses = Pool(processes=4)
+    # result = multi_proceses.map(multiprocess, (max_values, lst_directed_edges, edges, weights))
+    # edges, weights  = result[0], result[1]
+
+    Adj = adjacency(edges, weights, V, m).cuda()
+    AdjVec = torch.mm(Adj, torch.unsqueeze(X,1))
+    
+    return AdjVec
+
+'''
+    for i, val in enumerate(max_values):
+        u,v = lst_directed_edges[i]
+        if val == 0: 
+            edges.extend([[u, u], [v, v]])
+            if (u,u) not in weights:
+                weights[(u,u)] = 0
+            weights[(u,u)] += float(1)
+
+            if (v,v) not in weights:
+                weights[(v,v)] = 0
+            weights[(v,v)] += float(1)
+        else: 
             edges.extend([[u, v], [v, u]])
             if (u,v) not in weights:
                 weights[(u,v)] = 0
@@ -491,18 +605,39 @@ def Laplacian_Nonlinear_coordinate(V, E, X, m):
             if (v,u) not in weights:
                 weights[(v,u)] = 0
             weights[(v,u)] += float(1) 
-        else: 
-            edges.extend([[u, u], [v, v]])
-            if (u,u) not in weights:
-                weights[(u,u)] = 0
-            weights[(u,u)] += float(1)
 
-            if (v,v) not in weights:
-                weights[(v,v)] = 0
-            weights[(v,v)] += float(1)   
-    
-    return adjacency(edges, weights, V, m)
 
+    # Adj = coo_matrix((np.ones(len(row)), (row, col)), shape=(size, size), dtype=np.float32)
+
+    # # A_sym = 0.5*(A + A.T) # symmetrized adjacency
+    # G_undirected = nx.from_scipy_sparse_matrix(Adj)
+    # G = nx.from_scipy_sparse_matrix(Adj,create_using=nx.DiGraph)
+    # assert G.is_directed()
+    # directed_edges = [e for e in G.edges]
+    # diag = coo_matrix( (np.ones(size), (np.arange(size), np.arange(size))), shape=(size, size), dtype=np.float32)
+
+    # for k in directed_edges:
+    #     u,v = k[0], k[1]
+    #     if p[u] >= p[v]:
+    #         edges.extend([[u, v], [v, u]])
+    #         if (u,v) not in weights:
+    #             weights[(u,v)] = 0
+    #         weights[(u,v)] += float(1)
+
+    #         if (v,u) not in weights:
+    #             weights[(v,u)] = 0
+    #         weights[(v,u)] += float(1) 
+    #     else: 
+    #         edges.extend([[u, u], [v, v]])
+    #         if (u,u) not in weights:
+    #             weights[(u,u)] = 0
+    #         weights[(u,u)] += float(1)
+
+    #         if (v,v) not in weights:
+    #             weights[(v,v)] = 0
+    #         weights[(v,v)] += float(1) 
+
+'''
 
 
 
@@ -565,8 +700,6 @@ def Laplacian(V, E, X, m):
     
     return adjacency(edges, weights, V)
 
-
-
 def update(Se, Ie, mediator, weights, c):
     """
     updates the weight on {Se,mediator} and {Ie,mediator}
@@ -589,8 +722,6 @@ def update(Se, Ie, mediator, weights, c):
     weights[(mediator,Ie)] += float(1/c)
 
     return weights
-
-
 
 def adjacency(edges, weights, n,m):
     """
@@ -617,21 +748,20 @@ def adjacency(edges, weights, n,m):
     adj = sp.coo_matrix((weights, (edges[:, 0], edges[:, 1])), shape=(n, n), dtype=np.float32)
     adj = adj + sp.eye(n)
 
-    if m:
-        # random.seed(9001) 
-        alpha = random.random()
-        # print(alpha)
-        A = rjnormalise(sp.csr_matrix(adj, dtype=np.float32), n,alpha)
-        # GG = nx.from_scipy_sparse_matrix(A)
-        # print(nx.is_connected(GG))
-    else:
-        A = symnormalise(sp.csr_matrix(adj, dtype=np.float32))
-        # GG = nx.from_scipy_sparse_matrix(A)
-        # print(nx.is_connected(GG))
-    A = ssm2tst(A)
-    return A
-
-
+    # if m:
+    #     # random.seed(9001) 
+    #     alpha = random.random()
+    #     print(alpha)
+    #     A = rjnormalise(sp.csr_matrix(adj, dtype=np.float32), n,alpha)
+    #     GG = nx.from_scipy_sparse_matrix(A)
+    #     print(nx.is_connected(GG))
+    # else:
+    #     # A = sp.csr_matrix(adj, dtype=np.float32)
+    #     # A = symnormalise(sp.csr_matrix(adj, dtype=np.float32))
+    #     GG = nx.from_scipy_sparse_matrix(adj)
+    #     print(nx.is_connected(GG))
+    # # A = ssm2tst(A)
+    return adj
 
 def symnormalise(M):
     """
@@ -689,8 +819,6 @@ def rjnormalise(M,n,alpha):
 
     
     return random_jump_adj
-
-
 
 def ssm2tst(M):
     """

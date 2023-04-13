@@ -28,10 +28,11 @@ def parse_args():
     parser.add_argument('--log_root', type=str, default='../logs/', help='the path saving model.t7 and the training process')
     parser.add_argument('--log_path', type=str, default='test', help='the path saving model.t7 and the training process, the name of folder will be log/(current time)')
     parser.add_argument('--data_path', type=str, default='code/dataset/data/tmp/', help='data set folder, for default format see dataset/cora/cora.edges and cora.node_labels')
-    parser.add_argument('--dataset', type=str, default='cora_ml/', help='data set selection')
+    parser.add_argument('--dataset', type=str, default='WebKB/Cornell', help='data set selection')
 
-    parser.add_argument('--epochs', type=int, default=3000, help='Number of (maximal) training epochs.')
-    parser.add_argument('--q', type=float, default=0, help='q value for the phase matrix')
+    parser.add_argument('--epochs', type=int, default=1500, help='Number of (maximal) training epochs.')
+    parser.add_argument('--q', type=float, default=0.25, help='q value for the phase matrix')
+    parser.add_argument('--mediators', action='store_true', help='True for Laplacian with mediators, False for Laplacian without mediators')
     parser.add_argument('--method_name', type=str, default='Magnet', help='method name')
 
     parser.add_argument('--K', type=int, default=1, help='K for cheb series')
@@ -54,6 +55,20 @@ def sparse_mx_to_torch_sparse_tensor(sparse_mx):
     values = torch.from_numpy(sparse_mx.data)
     shape = torch.Size(sparse_mx.shape)
     return torch.sparse.FloatTensor(indices, values, shape)
+
+def print_statistics(results):
+    
+    val_total_acc = results[:, 0]
+    val_total_acc_str = f'{val_total_acc.mean():.4f} ± {val_total_acc.std():.4f}'
+    test_total_acc = results[:, 1]
+    test_total_acc_str = f'{test_total_acc.mean():.4f} ± {test_total_acc.std():.4f}'
+    val_total_acc_latest = results[:, 2]
+    val_total_acc_latest_str = f'{val_total_acc_latest.mean():.4f} ± {val_total_acc_latest.std():.4f}'
+    test_total_acc_latest = results[:, 3]
+    test_total_acc_latest_str = f'{test_total_acc_latest.mean():.4f} ± {test_total_acc_latest.std():.4f}'
+    print(f'All runs:')
+    logstr = 'val_acc: '+val_total_acc_str+' test_acc: '+test_total_acc_str+' val_acc_latest: '+val_total_acc_latest_str+' test_acc_latest: '+test_total_acc_latest_str
+    print(logstr)
 
 def main(args):
     if args.randomseed > 0:
@@ -81,7 +96,7 @@ def main(args):
         print("wrong dataset name !!!")
         return
 
-    dataset, X, label, train_mask, val_mask, test_mask, L = geometric_dataset_sparse(args.q, args.K, 
+    dataset, X, label, train_mask, val_mask, test_mask, L = geometric_dataset_sparse(args.q, args.K, args.mediators, 
                             root=args.data_path+load_func, subset=subset,
                             dataset = func, load_only = False, save_pk = True)
   
@@ -111,7 +126,8 @@ def main(args):
         log_str_full = ''
 
         model = MagNet(X_real.size(-1), L_real, L_img, K = args.K, label_dim=cluster_dim, layer = args.layer,
-                        num_filter = args.num_filter, dropout=args.dropout).to(device)    
+                        num_filter = args.num_filter, dropout=args.dropout).to(device) 
+        print(model.parameters())   
  
         opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.l2)
 
@@ -221,6 +237,7 @@ def main(args):
             file.write(log_str_full)
             file.write('\n')
         torch.cuda.empty_cache()
+    print_statistics(results)
     return results
 
 if __name__ == "__main__":

@@ -84,7 +84,7 @@ def accuracy(Z, Y):
 
 
 
-def initialise(dataset,X, label,cluster_dim, args):
+def initialise(dataset,X, label,train_idx,cluster_dim, args):
     """
     initialises GCN, optimiser, normalises graph, and features, and sets GPU number
     
